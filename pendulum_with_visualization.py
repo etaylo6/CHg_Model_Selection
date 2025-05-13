@@ -24,8 +24,7 @@ d_omega = Node("delta omega")
 c = Node("damping coeff", 1.5)
 alpha = Node("alpha")
 time_step = Node("time_step", .03)
-
-time = Node("t")
+time = Node("time", 0.0)
 
 ########################################
 ##### Define Custom Relations ##########
@@ -37,12 +36,12 @@ time = Node("t")
 def integrate(s1, s2, s3, **kwargs):
     return s1 * s3 + s2
 
-# def closed_form_theta(s1, s2, s3, s4, **kwargs):
-#     θ0 = kwargs['s1']
-#     g_ = kwargs['s2']
-#     ℓ  = kwargs['s3']
-#     t  = kwargs['s4']
-#     return θ0 * np.cos(np.sqrt(g_/ℓ) * t)
+def closed_form_theta(s1, s2, s3, s4, **kwargs):
+      θ0 = kwargs['s1']
+      g_ = kwargs['s2']
+      ℓ  = kwargs['s3']
+      t  = kwargs['s4']
+      return θ0 * np.cos(np.sqrt(g_/ℓ) * t)
 
 
 ####################################
@@ -100,7 +99,7 @@ hg.add_edge({'s1':F, 's2':'beta2'},
 hg.add_edge({'s1': alpha,'s2': omega,'s3': time_step}, 
             target=omega,
             rel=integrate, 
-            label='(alpha, omega, t)->omega',
+            label='int_w',
             index_via= lambda s1, s2, s3, **kwargs: s1 - 1 == s2)
             
 
@@ -116,28 +115,27 @@ hg.add_edge({'s1':theta,'s2':omega},
             via=lambda s1, s2, **kwargs : abs(s1) < .05 and abs(s2) < .05, edge_props='LEVEL')
 
 
+##############################################
+###### Introduction of Global Time Tracking ##
+##############################################
 
 
-# hg.add_edge(
-#     {'s1': dt,
-#      's2': (theta0, 'index')},    # <– use the Node instance theta0, not the string
-#     time,
-#     R.Rmultiply,
-#     label='t = dt⋅i'
-# )
+hg.add_edge({time, time_step},
+    target=time,         
+    rel=R.Rsum,       
+    label='time',  
+    index_offset=1)
 
-
-# ### Added Linearized Edges
-# hg.add_edge(
-#     {'s1': theta0, 
-#      's2': g, 
-#      's3': r, 
-#      's4': time},
-#     theta,
-#     closed_form_theta,
-#     label='Linearized'
-# )
-
+hg.add_edge(
+    {'s1': theta,
+     's2': omega,
+     's3': time},               
+    target='final theta',
+    rel=R.equal('s1'),
+    via=lambda s1, s2, s3, **k: abs(s1)<.05 
+                               and abs(s2)<.05
+                               and s3 >= 0.0,
+    edge_props='LEVEL')
 # -------------------- 2) Symbol map --------------------
 
 symbol_map = {
@@ -190,75 +188,108 @@ plt.ylabel('Rad, Rad/s')
 plt.title('Pendulum Simulation')
 plt.show()
 
-# -------------------- 5) Build bipartite directed graph --------------------
 
-B = nx.DiGraph()
-var_nodes = list(hg.nodes.keys())
-B.add_nodes_from(var_nodes, bipartite=0)
-
-for eid, edge in hg.edges.items():
-    fnode = f"f:{eid}"
-    func  = getattr(edge, 'relation', None) or getattr(edge, 'rel', None)
-    name  = func.__name__ if func else None
-    sym   = symbol_map.get(name, edge.label or '?')
-    B.add_node(fnode, bipartite=1, label=sym)
-    for src in edge.source_nodes.values():
-        if isinstance(src, Node):
-            B.add_edge(src.label, fnode)
-    if isinstance(edge.target, Node):
-        B.add_edge(fnode, edge.target.label)
-
-# -------------------- 6) Layout --------------------
-
-pos = nx.spring_layout(B, k=1.0, iterations=100)
-
-# node labels
-node_labels = {
-    n: (n if B.nodes[n]['bipartite']==0 else B.nodes[n]['label'])
-    for n in B.nodes
-}
-
-# -------------------- 7) Draw with proper z-order --------------------
-
-fig2, ax2 = plt.subplots(figsize=(7,6))
-
-# 1) nodes
-nodes = nx.draw_networkx_nodes(
-    B, pos,
-    node_shape='s',
-    node_size=600,
-    node_color=[
-        'skyblue' if B.nodes[n]['bipartite']==0 else 'gray'
+def draw_hypergraph_bipartite(hg, symbol_map,
+                              figsize=(7,6),
+                              layout_fn=nx.spring_layout,
+                              layout_kwargs=None):
+    """
+    Draw a CHG Hypergraph hg as a bipartite directed graph.
+    
+    Parameters
+    ----------
+    hg : Hypergraph
+      Your ConstraintHG hypergraph.
+    symbol_map : dict
+      Maps relation-function names (edge.relation.__name__) to symbols.
+      Falls back to edge.label if missing.
+    figsize : tuple
+      Matplotlib figure size.
+    layout_fn : callable
+      A NetworkX layout function (e.g. nx.spring_layout).
+    layout_kwargs : dict
+      kwargs to pass to layout_fn (e.g. {'k':1.0,'iterations':100}).
+    
+    Returns
+    -------
+    fig, ax : the matplotlib figure and axes.
+    """
+    # 1) Build the bipartite DiGraph
+    B = nx.DiGraph()
+    var_nodes = list(hg.nodes.keys())
+    B.add_nodes_from(var_nodes, bipartite=0)
+    
+    for eid, edge in hg.edges.items():
+        fnode = f"f:{eid}"
+        # lookup relation name
+        func = getattr(edge, 'relation', None) or getattr(edge, 'func', None)
+        name = func.__name__ if func else None
+        sym  = symbol_map.get(name, edge.label or '?')
+        
+        B.add_node(fnode, bipartite=1, label=sym)
+        # sources → function node
+        for src in edge.source_nodes.values():
+            if isinstance(src, Node):
+                B.add_edge(src.label, fnode)
+        # function node → target
+        if isinstance(edge.target, Node):
+            B.add_edge(fnode, edge.target.label)
+    
+    # 2) Compute layout
+    if layout_kwargs is None:
+        layout_kwargs = {'k':1.0, 'iterations':100, 'seed':42}
+    pos = layout_fn(B, **layout_kwargs)
+    
+    # 3) Prepare node labels
+    node_labels = {
+        n: (n if B.nodes[n]['bipartite']==0 else B.nodes[n]['label'])
         for n in B.nodes
-    ],
-    ax=ax2
-)
-nodes.set_zorder(1)
+    }
+    
+    # 4) Draw
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # 4a) nodes (squares) at zorder=1
+    nodes = nx.draw_networkx_nodes(
+        B, pos,
+        node_shape='s',
+        node_size=600,
+        node_color=[
+            'skyblue' if B.nodes[n]['bipartite']==0 else 'gray'
+            for n in B.nodes
+        ],
+        ax=ax
+    )
+    nodes.set_zorder(1)
+    
+    # 4b) edges (arrows) at zorder=2
+    edges = nx.draw_networkx_edges(
+        B, pos,
+        arrows=True,
+        arrowstyle='-|>',
+        arrowsize=12,
+        width=0.5,
+        edge_color='gray',
+        ax=ax
+    )
+    for art in edges:
+        art.set_zorder(2)
+    
+    # 4c) labels at zorder=3
+    texts = nx.draw_networkx_labels(
+        B, pos,
+        labels=node_labels,
+        font_size=10,
+        ax=ax
+    )
+    for txt in texts.values():
+        txt.set_zorder(3)
+    
+    ax.set_title("Hypergraph as Bipartite Directed Graph\n(vars in blue, funcs in gray)")
+    ax.axis('off')
+    plt.tight_layout()
+    return fig, ax
 
-# 2) edges
-edges = nx.draw_networkx_edges(
-    B, pos,
-    arrows=True,
-    arrowstyle='-|>',
-    arrowsize=12,
-    width=0.5,
-    edge_color='gray',
-    ax=ax2
-)
-for art in edges:
-    art.set_zorder(2)
 
-# 3) labels
-texts = nx.draw_networkx_labels(
-    B, pos,
-    labels=node_labels,
-    font_size=10,
-    ax=ax2
-)
-for txt in texts.values():
-    txt.set_zorder(3)
-
-ax2.set_title("Pendulum HG as Bipartite Directed Graph\n(vars in blue, funcs in gray)")
-ax2.axis('off')
-plt.tight_layout()
+fig, ax = draw_hypergraph_bipartite(hg, symbol_map)
 plt.show()
